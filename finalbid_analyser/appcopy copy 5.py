@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-import os, json, re, tempfile, time, threading, hashlib, uuid, mimetypes
+import os, json, re, tempfile, time, threading, hashlib, uuid, mimetypes, base64
 import streamlit as st
 from openai import OpenAI
 from io import BytesIO
@@ -278,6 +278,15 @@ def _st_spinner(message: str):
     if _can_update_ui():
         return st.spinner(message)
     return nullcontext()
+
+def _session_state_get(key: str, default=None):
+    """Read session_state only when a Streamlit script context exists."""
+    if not _can_update_ui():
+        return default
+    try:
+        return st.session_state.get(key, default)
+    except Exception:
+        return default
 
 def _get_openai_api_key() -> str:
     try:
@@ -3250,11 +3259,8 @@ def _seconds_until_next_run(times: list[tuple[int, int]]) -> float:
     nxt = min(next_times)
     return max(1.0, (nxt - now).total_seconds())
 
-def _get_onedrive_root() -> str:
-    try:
-        override = st.session_state.get("onedrive_root_override")
-    except Exception:
-        override = None
+def _get_onedrive_root(use_ui_override: bool = True) -> str:
+    override = _session_state_get("onedrive_root_override") if use_ui_override else None
     env_root = (
         os.getenv("ONEDRIVE_SCAN_ROOT", "").strip()
         or os.getenv("ONEDRIVE_SYNC_PATH", "").strip()
@@ -3262,34 +3268,299 @@ def _get_onedrive_root() -> str:
     )
     return (override or env_root or "").strip()
 
-def _get_onedrive_scan_enabled() -> bool:
-    try:
-        override = st.session_state.get("onedrive_scan_enabled_override")
-    except Exception:
-        override = None
+def _get_onedrive_scan_enabled(use_ui_override: bool = True) -> bool:
+    override = _session_state_get("onedrive_scan_enabled_override") if use_ui_override else None
     if override is not None:
         return bool(override)
     env_val = os.getenv("ONEDRIVE_SCAN_ENABLED", "0").strip().lower()
     return env_val in ("1", "true", "yes", "y", "on")
 
-def _get_onedrive_scan_times() -> list[tuple[int, int]]:
-    try:
-        override = st.session_state.get("onedrive_scan_times_override")
-    except Exception:
-        override = None
+def _get_onedrive_scan_times(use_ui_override: bool = True) -> list[tuple[int, int]]:
+    override = _session_state_get("onedrive_scan_times_override") if use_ui_override else None
     return _parse_scan_times(override or os.getenv("ONEDRIVE_SCAN_TIMES", "00:00,12:00"))
 
-def _get_onedrive_max_chars() -> int:
-    try:
-        override = st.session_state.get("onedrive_max_chars_override")
-        if override is not None:
-            return int(override)
-    except Exception:
-        pass
+def _get_onedrive_max_chars(use_ui_override: bool = True) -> int:
+    if use_ui_override:
+        try:
+            override = _session_state_get("onedrive_max_chars_override")
+            if override is not None:
+                return int(override)
+        except Exception:
+            pass
     try:
         return int(os.getenv("ONEDRIVE_MAX_CHARS", "250000"))
     except Exception:
         return 250000
+
+def _is_web_url(val: str) -> bool:
+    s = (val or "").strip().lower()
+    return s.startswith("http://") or s.startswith("https://")
+
+def _is_valid_onedrive_source(val: str) -> bool:
+    src = (val or "").strip()
+    if not src:
+        return False
+    if _is_web_url(src):
+        return True
+    return os.path.isdir(src)
+
+def _graph_requirements() -> tuple[bool, str]:
+    tenant = os.getenv("ONEDRIVE_TENANT_ID", "").strip()
+    client_id = os.getenv("ONEDRIVE_CLIENT_ID", "").strip()
+    client_secret = os.getenv("ONEDRIVE_CLIENT_SECRET", "").strip()
+    if not tenant or not client_id or not client_secret:
+        return False, "Missing ONEDRIVE_TENANT_ID / ONEDRIVE_CLIENT_ID / ONEDRIVE_CLIENT_SECRET"
+    return True, ""
+
+def _graph_get_token() -> str | None:
+    ok, msg = _graph_requirements()
+    if not ok:
+        _get_onedrive_logger().error("Graph auth config error: %s", msg)
+        return None
+    tenant = os.getenv("ONEDRIVE_TENANT_ID", "").strip()
+    client_id = os.getenv("ONEDRIVE_CLIENT_ID", "").strip()
+    client_secret = os.getenv("ONEDRIVE_CLIENT_SECRET", "").strip()
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
+    }
+    try:
+        import requests  # type: ignore
+        r = requests.post(token_url, data=data, timeout=30)
+        if r.status_code >= 400:
+            _get_onedrive_logger().error("Graph token failed: status=%s body=%s", r.status_code, r.text[:300])
+            return None
+        return (r.json() or {}).get("access_token")
+    except Exception:
+        _get_onedrive_logger().exception("Graph token request failed")
+        return None
+
+def _graph_encode_share_url(share_url: str) -> str:
+    b64 = base64.urlsafe_b64encode(share_url.encode("utf-8")).decode("utf-8").rstrip("=")
+    return f"u!{b64}"
+
+def _graph_resolve_share_folder(share_url: str, token: str) -> dict | None:
+    try:
+        import requests  # type: ignore
+        share_id = _graph_encode_share_url(share_url)
+        url = f"https://graph.microsoft.com/v1.0/shares/{share_id}/driveItem"
+        headers = {"Authorization": f"Bearer {token}"}
+        r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code >= 400:
+            _get_onedrive_logger().error("Graph resolve share failed: status=%s body=%s", r.status_code, r.text[:300])
+            return None
+        item = r.json() or {}
+        parent = item.get("parentReference") or {}
+        drive_id = (item.get("remoteItem") or {}).get("parentReference", {}).get("driveId") or parent.get("driveId")
+        item_id = (item.get("remoteItem") or {}).get("id") or item.get("id")
+        name = (item.get("remoteItem") or {}).get("name") or item.get("name") or "ShareFolder"
+        if not drive_id or not item_id:
+            return None
+        return {"drive_id": drive_id, "item_id": item_id, "name": name}
+    except Exception:
+        _get_onedrive_logger().exception("Graph resolve share exception")
+        return None
+
+def _graph_list_files_recursive(token: str, drive_id: str, root_item_id: str) -> list[dict]:
+    files: list[dict] = []
+    stack: list[tuple[str, str]] = [(root_item_id, "")]
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        import requests  # type: ignore
+        while stack:
+            item_id, rel_prefix = stack.pop()
+            url = (
+                f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/children"
+                "?$top=200&$select=id,name,size,lastModifiedDateTime,file,folder"
+            )
+            while url:
+                r = requests.get(url, headers=headers, timeout=45)
+                if r.status_code >= 400:
+                    _get_onedrive_logger().error("Graph list children failed: status=%s body=%s", r.status_code, r.text[:300])
+                    break
+                payload = r.json() or {}
+                for it in payload.get("value", []) or []:
+                    name = (it.get("name") or "").strip()
+                    if not name:
+                        continue
+                    rel_path = f"{rel_prefix}/{name}".strip("/")
+                    if it.get("folder"):
+                        stack.append((it.get("id"), rel_path))
+                        continue
+                    if it.get("file"):
+                        if name.lower().endswith(_ONEDRIVE_ALLOWED_EXTS):
+                            files.append(
+                                {
+                                    "id": it.get("id"),
+                                    "name": name,
+                                    "rel_path": rel_path,
+                                    "size": int(it.get("size") or 0),
+                                    "modified": (it.get("lastModifiedDateTime") or ""),
+                                }
+                            )
+                url = payload.get("@odata.nextLink")
+    except Exception:
+        _get_onedrive_logger().exception("Graph recursive list failed")
+    return sorted(files, key=lambda x: x.get("rel_path", ""))
+
+def _graph_download_file(token: str, drive_id: str, item_id: str) -> bytes:
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}/content"
+    try:
+        import requests  # type: ignore
+        r = requests.get(url, headers=headers, timeout=120)
+        if r.status_code >= 400:
+            _get_onedrive_logger().error("Graph file download failed: status=%s body=%s", r.status_code, r.text[:300])
+            return b""
+        return r.content or b""
+    except Exception:
+        _get_onedrive_logger().exception("Graph file download exception")
+        return b""
+
+def _cloud_signature(items: list[dict]) -> str:
+    parts = [f"{i.get('rel_path')}|{i.get('size')}|{i.get('modified')}" for i in (items or [])]
+    joined = "||".join(sorted(parts))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+def _folder_label_for_share(share_url: str, folder_name: str = "ShareFolder") -> str:
+    h = hashlib.sha1((share_url or "").lower().encode("utf-8")).hexdigest()[:8]
+    base = re.sub(r"[^\w\- ]+", "_", (folder_name or "ShareFolder")).strip() or "ShareFolder"
+    return f"FOLDER_{base}_{h}"
+
+def _process_onedrive_share_url(share_url: str, use_ui_override: bool = True) -> bool:
+    log = _get_onedrive_logger()
+    if not _ONEDRIVE_SCAN_LOCK.acquire(blocking=False):
+        log.info("Skip: scan already running. share=%s", share_url)
+        return False
+    try:
+        token = _graph_get_token()
+        if not token:
+            log.error("Graph token unavailable; cannot scan share url")
+            return False
+        resolved = _graph_resolve_share_folder(share_url, token)
+        if not resolved:
+            log.error("Failed to resolve share url: %s", share_url)
+            return False
+        drive_id = resolved.get("drive_id")
+        item_id = resolved.get("item_id")
+        folder_name = resolved.get("name") or "ShareFolder"
+        if not drive_id or not item_id:
+            log.error("Resolved share missing drive/item ids")
+            return False
+
+        files = _graph_list_files_recursive(token, drive_id, item_id)
+        signature = _cloud_signature(files)
+        state_key = f"share://{share_url.strip()}"
+        label = _folder_label_for_share(share_url, folder_name)
+        if not files:
+            log.info("No eligible files in shared folder; label=%s", label)
+            return False
+
+        ok, conn, _, _ = _open_mysql_or_create()
+        if not ok:
+            log.error("DB connect failed for share scan")
+            return False
+        try:
+            _ensure_eval_tables(conn)
+            _ensure_onedrive_tables(conn)
+            state = _get_onedrive_folder_state(conn, state_key)
+            last_sig = (state or {}).get("last_signature")
+            if last_sig and last_sig == signature:
+                log.info("No changes; skipping shared folder. label=%s", label)
+                _upsert_onedrive_folder_state(
+                    conn,
+                    state_key,
+                    folder_label=label,
+                    signature=signature,
+                    scanned=True,
+                    evaluated=False,
+                )
+                return False
+
+            max_chars = _get_onedrive_max_chars(use_ui_override=use_ui_override)
+            prefer_fast_pdf = True
+            force_pdf_ocr = False
+            pdf_fast_max_pages = 30
+            combined_parts: list[str] = []
+            attached_files: list[tuple[str, bytes]] = []
+            combined_len = 0
+
+            log.info("Processing shared folder: label=%s files=%d", label, len(files))
+            for meta in files:
+                if combined_len >= int(max_chars):
+                    log.info("Reached max_chars in shared folder; label=%s chars=%d", label, combined_len)
+                    break
+                fname = meta.get("name") or "file.bin"
+                fbytes = _graph_download_file(token, drive_id, meta.get("id"))
+                if not fbytes:
+                    continue
+                try:
+                    save_uploaded_file(fbytes, fname, skip_if_exists=True)
+                except Exception:
+                    pass
+                attached_files.append((fname, fbytes))
+                try:
+                    t = extract_text_any(
+                        fbytes,
+                        fname,
+                        prefer_fast_pdf=prefer_fast_pdf,
+                        force_pdf_ocr=force_pdf_ocr,
+                        pdf_fast_max_pages=pdf_fast_max_pages,
+                    ).strip()
+                except Exception:
+                    t = ""
+                if not t:
+                    continue
+                rel_path = meta.get("rel_path") or fname
+                block = f"\n\n===== FILE: {rel_path} =====\n{t}"
+                combined_parts.append(block)
+                combined_len += len(block)
+
+            combined_text = ("\n".join(combined_parts)).strip()
+            if not combined_text:
+                log.warning("No extractable text from shared folder; label=%s", label)
+                _upsert_onedrive_folder_state(
+                    conn,
+                    state_key,
+                    folder_label=label,
+                    signature=signature,
+                    scanned=True,
+                    evaluated=False,
+                )
+                return False
+
+            bypass = bool(_session_state_get("bypass_decision", False)) if use_ui_override else False
+            _st_safe(st.info, f"OneDrive cloud-sync: evaluating {label}")
+            _, _ = analyze_with_gpt(
+                combined_text,
+                file_name=label,
+                bypass_decision=bypass,
+                file_hash=get_file_hash(combined_text.encode("utf-8")),
+                attached_files=attached_files,
+            )
+            _upsert_onedrive_folder_state(
+                conn,
+                state_key,
+                folder_label=label,
+                signature=signature,
+                scanned=True,
+                evaluated=True,
+            )
+            log.info("Shared folder evaluation complete: label=%s", label)
+            return True
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            _ONEDRIVE_SCAN_LOCK.release()
+        except Exception:
+            pass
 
 def _list_project_folders(root_path: str) -> list[str]:
     try:
@@ -3380,7 +3651,7 @@ def _folder_label_for_path(folder_path: str) -> str:
     h = hashlib.sha1(folder_path.lower().encode("utf-8")).hexdigest()[:8]
     return f"FOLDER_{base}_{h}"
 
-def _process_onedrive_folder(folder_path: str) -> bool:
+def _process_onedrive_folder(folder_path: str, use_ui_override: bool = True) -> bool:
     """Return True if evaluation ran, False if skipped."""
     log = _get_onedrive_logger()
     if not os.path.isdir(folder_path):
@@ -3437,7 +3708,7 @@ def _process_onedrive_folder(folder_path: str) -> bool:
                 )
                 return False
 
-            max_chars = _get_onedrive_max_chars()
+            max_chars = _get_onedrive_max_chars(use_ui_override=use_ui_override)
             prefer_fast_pdf = True
             force_pdf_ocr = False
             pdf_fast_max_pages = 30
@@ -3495,10 +3766,7 @@ def _process_onedrive_folder(folder_path: str) -> bool:
 
             log.info("Evaluating folder: label=%s chars=%d", label, len(combined_text))
             _st_safe(st.info, f"OneDrive auto-sync: evaluating {label}")
-            try:
-                bypass = bool(st.session_state.get("bypass_decision"))
-            except Exception:
-                bypass = False
+            bypass = bool(_session_state_get("bypass_decision", False)) if use_ui_override else False
             _, _ = analyze_with_gpt(
                 combined_text,
                 file_name=label,
@@ -3529,11 +3797,19 @@ def _process_onedrive_folder(folder_path: str) -> bool:
         except Exception:
             pass
 
-def scan_onedrive_root() -> int:
+def scan_onedrive_root(use_ui_override: bool = True) -> int:
     """Scan the configured OneDrive root. Returns number of evaluated folders."""
     log = _get_onedrive_logger()
-    root = _get_onedrive_root()
-    if not root or not os.path.isdir(root):
+    root = _get_onedrive_root(use_ui_override=use_ui_override)
+    if not root:
+        log.error("OneDrive root not found: %s", root)
+        return 0
+    if _is_web_url(root):
+        log.info("Scan start (cloud): source=%s", root)
+        ran = 1 if _process_onedrive_share_url(root, use_ui_override=use_ui_override) else 0
+        log.info("Scan complete (cloud): source=%s evaluated=%d", root, ran)
+        return ran
+    if not os.path.isdir(root):
         log.error("OneDrive root not found: %s", root)
         return 0
     folders = _list_project_folders(root)
@@ -3541,7 +3817,7 @@ def scan_onedrive_root() -> int:
     log.info("Scan start: root=%s folders=%d", root, len(folders))
     for folder in folders:
         try:
-            if _process_onedrive_folder(folder):
+            if _process_onedrive_folder(folder, use_ui_override=use_ui_override):
                 ran += 1
         except Exception:
             log.exception("Folder scan failed: %s", folder)
@@ -3553,13 +3829,14 @@ def _onedrive_scheduler_loop():
     log = _get_onedrive_logger()
     while True:
         try:
-            times = _get_onedrive_scan_times()
+            # Scheduler runs in a background thread: avoid session_state access.
+            times = _get_onedrive_scan_times(use_ui_override=False)
             sleep_s = _seconds_until_next_run(times)
             log.info("Scheduler sleeping for %.1f seconds", sleep_s)
             time.sleep(sleep_s)
-            if _get_onedrive_scan_enabled():
+            if _get_onedrive_scan_enabled(use_ui_override=False):
                 log.info("Scheduled scan triggered")
-                scan_onedrive_root()
+                scan_onedrive_root(use_ui_override=False)
         except Exception:
             # Avoid tight crash loops
             log.exception("Scheduler loop error")
@@ -4176,12 +4453,12 @@ with st.expander("Folder / Batch Evaluation (multiple documents)", expanded=Fals
 
 # ----------------- OneDrive Auto Sync -----------------
 with st.expander("OneDrive Auto Sync", expanded=False):
-    st.caption("Uses a locally synced OneDrive/SharePoint folder path. The web link must be synced to this machine.")
+    st.caption("Supports local folder path OR a SharePoint/OneDrive shared folder URL (cloud mode via Microsoft Graph).")
     st.text_input(
-        "OneDrive root folder (local path)",
+        "OneDrive source (local path or shared folder URL)",
         value=_get_onedrive_root(),
         key="onedrive_root_override",
-        help="Example: C:\\Users\\<you>\\OneDrive - Ikio\\RFPs",
+        help="Example local: C:\\Users\\<you>\\OneDrive - Ikio\\RFPs | Example cloud: https://...sharepoint.com/:f:/...",
     )
     st.checkbox(
         "Enable scheduled scan (12:00 AM and 12:00 PM by default)",
@@ -4203,12 +4480,12 @@ with st.expander("OneDrive Auto Sync", expanded=False):
     )
     if st.button("Run OneDrive Scan Now", key="run_onedrive_scan_now"):
         root = _get_onedrive_root()
-        if not root or not os.path.isdir(root):
-            st.error("❌ OneDrive root folder is not set or not found.")
+        if not _is_valid_onedrive_source(root):
+            st.error("OneDrive source is not set or not reachable.")
         else:
             with _st_spinner("Scanning OneDrive folders..."):
                 n = scan_onedrive_root()
-            st.success(f"✅ OneDrive scan completed. Evaluated {n} folder(s).")
+            st.success(f"OneDrive scan completed. Evaluated {n} folder(s).")
 
 # Start scheduler after UI overrides are applied
 if _get_onedrive_scan_enabled():
